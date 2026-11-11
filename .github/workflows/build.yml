@@ -140,23 +140,34 @@ jobs:
 
   # ---------------------------------------------------------------------------
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    # push na main (ou tag v*) com tudo passando: cria/atualiza a Release da
+    # versão do CMakeLists.txt (project(... VERSION x.y.z)). Versão nova = mudar lá.
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: [ linux-tests, macos ]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+      - name: Versão
+        run: echo "VERSION=$(grep -m1 -oE 'project\(VoiceGOClean VERSION [0-9.]+' CMakeLists.txt | awk '{print $3}')" >> $GITHUB_ENV
       - uses: actions/download-artifact@v4
         with: { name: Instalador-macOS-Universal, path: dist }
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          tag_name: v${{ env.VERSION }}
+          target_commitish: ${{ github.sha }}
+          name: VoiceGO Clean ${{ env.VERSION }}
           make_latest: true
+          overwrite_files: true
+          files: dist/*
           body: |
             **VoiceGO Clean para macOS — Universal** (Apple Silicon M1/M2/M3/M4 e Intel, macOS 10.13+)
 
-            Baixe o `.pkg` e dê dois cliques. Instala o plugin VST3, o AU e o app.
-            Depois, no REAPER: Options › Preferences › Plug-ins › VST › Re-scan.
+            Baixe o `VoiceGO-Clean-${{ env.VERSION }}-macOS-Universal.pkg` e dê dois cliques.
+            Instala o plugin **VST3**, o **AU** e o **app** (em *Personalizar* você escolhe).
+
+            Depois, no REAPER: Options › Preferences › Plug-ins › VST › Re-scan. No Logic/GarageBand: basta reabrir.
 
             Primeira vez (instalador ainda sem assinatura): se aparecer "desenvolvedor não identificado",
             vá em Ajustes do Sistema › Privacidade e Segurança › **Abrir Mesmo Assim**.

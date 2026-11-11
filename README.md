@@ -44,7 +44,7 @@ Processamento no domínio STFT (FFT de 2048 a 44,1/48 kHz, 75% de sobreposição
 
 O workflow `.github/workflows/build.yml` faz tudo a cada push: compila num Mac da nuvem em **Universal
 (arm64 + x86_64)**, roda os testes, monta o `.pkg`, instala de verdade e valida o AU com o `auval` da Apple.
-Para publicar uma Release: crie uma tag `v1.0.0`.
+A cada push na `main` com tudo passando, a Release `v<versão>` (versão do `CMakeLists.txt`) é criada ou atualizada com o `.pkg`. Versão nova = mudar `project(VoiceGOClean VERSION ...)`.
 
 Assinatura/notarização (opcional): configure os secrets `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`,
 `APPLE_ID`, `APPLE_TEAM_ID` e `APPLE_APP_PASSWORD`. Sem eles, os bundles saem com assinatura ad-hoc.
