@@ -270,7 +270,7 @@ namespace
         return failures == 0 ? 0 : 1;
     }
 
-    int processFile (const juce::File& in, const juce::File& out, float gv, float ga, float gr)
+    int processFile (const juce::File& in, const juce::File& out, float gv, float ga, float gr, bool neural = true)
     {
         juce::AudioFormatManager fm; fm.registerBasicFormats();
         std::unique_ptr<juce::AudioFormatReader> reader (fm.createReaderFor (in));
@@ -278,7 +278,7 @@ namespace
 
         const int chans = (int) juce::jmin (2u, reader->numChannels);
         const int len = (int) reader->lengthInSamples;
-        SeparationEngine e; e.prepare (reader->sampleRate, chans);
+        SeparationEngine e; e.setNeuralEnabled (neural); e.prepare (reader->sampleRate, chans);
         const int L = e.getLatencySamples();
 
         juce::AudioBuffer<float> b (chans, len + L);
@@ -296,7 +296,8 @@ namespace
         std::unique_ptr<juce::AudioFormatWriter> w (wav.createWriterFor (os,
                                                     juce::AudioFormatWriterOptions{}.withSampleRate (reader->sampleRate).withNumChannels (chans).withBitsPerSample (24)));
         w->writeFromAudioSampleBuffer (trimmed, 0, len);
-        std::printf ("wrote %s\n", out.getFullPathName().toRawUTF8());
+        std::printf ("wrote %s  (engine %s, room RT60 estimate %.2f s)\n", out.getFullPathName().toRawUTF8(),
+                     e.isNeuralActive() ? "NEURAL" : "DSP", e.roomRt60.load());
         return 0;
     }
 }
@@ -320,14 +321,14 @@ int main (int argc, char** argv)
     if (args.size() >= 4 && args[0] == "speech")
         return speechTests (file (args[1]), file (args[2]), file (args[3]), args.size() >= 5 ? file (args[4]) : juce::File());
 
-    if (args.size() == 6 && args[0] == "process")
+    if ((args.size() == 6 || args.size() == 7) && args[0] == "process")
         return processFile (juce::File::getCurrentWorkingDirectory().getChildFile (args[1]),
                             juce::File::getCurrentWorkingDirectory().getChildFile (args[2]),
-                            dbArg (args[3]), dbArg (args[4]), dbArg (args[5]));
+                            dbArg (args[3]), dbArg (args[4]), dbArg (args[5]), args[6] != "dsp");
 
     std::printf ("usage: VoiceGOCleanTest selftest\n"
                  "       VoiceGOCleanTest plumbing                 (build with VOICEGO_DFN=stub)\n"
                  "       VoiceGOCleanTest speech clean.wav noise.wav rir.wav [outDir]\n"
-                 "       VoiceGOCleanTest process in.wav out.wav <voiceDb|off> <ambienceDb|off> <reverbDb|off>\n");
+                 "       VoiceGOCleanTest process in.wav out.wav <voiceDb|off> <ambienceDb|off> <reverbDb|off> [dsp]\n");
     return 2;
 }

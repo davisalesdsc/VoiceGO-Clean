@@ -37,6 +37,8 @@ public:
     /** Call before prepare(); true = use the neural voice model when available. */
     void setNeuralEnabled (bool shouldUse) noexcept { neuralWanted = shouldUse; }
     bool isNeuralActive() const noexcept { return useNeural; }
+    /** true: the network's phase is kept too (complex mask); false: magnitude-only mask. */
+    void setComplexMask (bool shouldUse) noexcept { complexMask = shouldUse; }
     const NeuralVoice& getNeural() const noexcept { return neural; }
 
     void prepare (double sampleRate, int numChannels);
@@ -57,6 +59,9 @@ public:
     };
 
     Levels levels;
+
+    /** Room decay time estimated blindly from the clean voice (neural mode), in seconds. */
+    std::atomic<float> roomRt60 { 0.0f };
 
     /** Per-component spectrum (mean power per log band, 40 Hz - 20 kHz), for the display. */
     static constexpr int numBands = 64;
@@ -109,7 +114,18 @@ private:
     int neuralDelay = 0, delayPos = 0;
     std::vector<std::vector<float>> delayLine;  // input delayed to line up with the neural estimate
     std::vector<float> zBuf, zData;             // aligned neural voice (time) and its spectrum
-    std::vector<float> neuralAmp, cleanSmooth, revFrac;
+    std::vector<float> neuralAmp, neuralRe, neuralIm, cleanSmooth, revFrac;
+    bool complexMask = true;
+    // blind RT60 estimation: the fastest decays of the clean voice reveal the room
+    void updateRoomEstimate() noexcept;
+    float rt60 = 0.3f;
+    std::vector<float> envDb;                   // recent clean-voice envelope (dB), ring
+    int envPos = 0, envLen = 24, preLen = 20, gapLen = 6, holdOff = 0, bandLo = 1, bandHi = 2;
+    int64_t frameCount = 0;
+    float recentPeakDb = -120.0f;
+    std::array<float, 48> decayCand {};         // recent decay-time candidates
+    std::array<int64_t, 48> decayWhen {};
+    int candPos = 0;
     std::vector<float> chainGain;               // resampling chain response (compensated in the mask)
     int neuralTopBin = 0;                       // last bin the network actually covers
 

@@ -123,11 +123,15 @@ namespace
     }
 
     /** Runs the engine on a mono signal (as dual mono) and returns the latency-compensated output. */
+    bool gComplexMask = true;
+    float gLastRt60 = 0.0f;
+
     Signal runEngine (const Signal& x, double sr, float gv, float ga, float gr, bool neural,
                       double* rtf = nullptr, int64_t* underruns = nullptr, bool* neuralActive = nullptr)
     {
         SeparationEngine e;
         e.setNeuralEnabled (neural);
+        e.setComplexMask (gComplexMask);
         e.prepare (sr, 2);
         e.setGains (gv, ga, gr);
         e.reset();
@@ -149,6 +153,7 @@ namespace
         const double secs = std::chrono::duration<double> (std::chrono::steady_clock::now() - t0).count();
         if (rtf != nullptr) *rtf = secs / ((double) b.getNumSamples() / sr);
         if (underruns != nullptr) *underruns = e.getNeural().getUnderruns();
+        gLastRt60 = e.roomRt60.load();
 
         Signal y ((size_t) n);
         for (int i = 0; i < n; ++i) y[(size_t) i] = 0.5f * (b.getSample (0, i + L) + b.getSample (1, i + L));
@@ -241,6 +246,7 @@ int speechTests (const juce::File& cleanF, const juce::File& noiseF, const juce:
     {
         const auto vr = runEngine (clean, sr, 1, 0, 1, true, &rtf);
         const auto v  = runEngine (clean, sr, 1, 0, 0, true);
+        check (gLastRt60 < 0.3f, "  room RT60 estimated on dry speech (s, < 0.3)", gLastRt60);
         const auto vd = runEngine (clean, sr, 1, 0, 0, false);
         check (siSdr (vr, clean, skip) > 15.0, "ambience muted: SI-SDR vs clean (dB, > 15)", siSdr (vr, clean, skip));
         check (siSdr (v, clean, skip) > 10.0, "ambience + reverb muted: SI-SDR vs clean (dB, > 10)", siSdr (v, clean, skip));
@@ -259,6 +265,21 @@ int speechTests (const juce::File& cleanF, const juce::File& noiseF, const juce:
         const auto vr = runEngine (noisy, sr, 1, 0, 1, true);
         const auto vd = runEngine (noisy, sr, 1, 0, 0, false);
         info ("input SI-SDR (dB)", base);
+        {
+            VgDfn* d = vg_dfn_create (100.0f);
+            const int hop = (int) vg_dfn_hop_size (d), delay = (int) vg_dfn_delay (d);
+            Signal raw (noisy.size() + (size_t) delay + (size_t) hop, 0.0f), in = noisy;
+            in.resize (raw.size(), 0.0f);
+            for (size_t pos = 0; pos + (size_t) hop <= in.size(); pos += (size_t) hop)
+                vg_dfn_process (d, in.data() + pos, raw.data() + pos);
+            vg_dfn_destroy (d);
+            raw.erase (raw.begin(), raw.begin() + delay);
+            raw.resize (noisy.size());
+            info ("  raw DeepFilterNet3 output: SI-SDR gain (reference)", siSdr (raw, clean, skip) - base);
+            gComplexMask = false;
+            info ("  magnitude-only mask, ambience muted: SI-SDR gain", siSdr (runEngine (noisy, sr, 1, 0, 1, true), clean, skip) - base);
+            gComplexMask = true;
+        }
         check (siSdr (vr, clean, skip) - base > 8.0, "ambience muted: SI-SDR gain (dB, > 8)", siSdr (vr, clean, skip) - base);
         check (siSdr (v, clean, skip) - base > 8.0, "ambience + reverb muted: SI-SDR gain (dB, > 8)", siSdr (v, clean, skip) - base);
         info ("  same, old DSP engine", siSdr (vd, clean, skip) - base);
@@ -287,7 +308,7 @@ int speechTests (const juce::File& cleanF, const juce::File& noiseF, const juce:
         info ("  same, old DSP engine", dbPow (energy (vd, skip) / energy (n, skip)));
     }
 
-    std::printf ("\n--- reverberant speech (RT60 0.79 s) + light noise ---\n");
+    std::printf ("\n--- reverberant speech (room T20 0.40 s, D/R -2 dB) + light noise ---\n");
     {
         size_t peak = 0;
         for (size_t i = 0; i < rir.size(); ++i) if (std::abs (rir[i]) > std::abs (rir[peak])) peak = i;
@@ -301,6 +322,7 @@ int speechTests (const juce::File& cleanF, const juce::File& noiseF, const juce:
         const double base = siSdr (in, dry, skip);
         const auto keep = runEngine (in, sr, 1, 0, 1, true);
         const auto cut  = runEngine (in, sr, 1, 0, 0, true);
+        check (gLastRt60 > 0.25f && gLastRt60 < 0.65f, "room RT60 estimated (measured T20 of the room: 0.40 s)", gLastRt60);
         info ("input SI-SDR vs direct sound (dB)", base);
         info ("ambience muted, reverb kept", siSdr (keep, dry, skip));
         check (siSdr (cut, dry, skip) >= siSdr (keep, dry, skip) - 0.5, "ambience + reverb muted (not worse than reverb kept)", siSdr (cut, dry, skip));

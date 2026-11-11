@@ -402,6 +402,15 @@ void Display::paintSpectrum (juce::Graphics& g, juce::Rectangle<float> r, const 
     g.setColour (col);
     g.drawText (name, header.withTrimmedTop (6.0f), juce::Justification::centredLeft);
 
+    // measured room (neural mode): shown under the reverb title
+    if (paramID == ParamIDs::reverb && proc.engine.isNeuralActive())
+    {
+        g.setFont (theme::font (10.0f));
+        g.setColour (theme::textDim);
+        g.drawText ("SALA ~" + juce::String (proc.engine.roomRt60.load(), 2) + " s",
+                    header.translated (0.0f, 16.0f).withTrimmedTop (6.0f), juce::Justification::centredLeft);
+    }
+
     const float db = proc.apvts.getRawParameterValue (paramID)->load();
     g.setFont (theme::font (14.0f, true));
     g.setColour (db <= KnobCurve::minDb + 0.05f ? theme::textMuted : theme::text);

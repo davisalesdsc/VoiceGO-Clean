@@ -17,7 +17,7 @@ pub struct VgDfn {
 /// Returns NULL on failure.
 #[no_mangle]
 pub extern "C" fn vg_dfn_create(atten_lim_db: f32) -> *mut VgDfn {
-    let r = catch_unwind(|| {
+    let r = catch_unwind(AssertUnwindSafe(|| {
         let rp = RuntimeParams::default_with_ch(1)
             .with_atten_lim(atten_lim_db)
             .with_thresholds(-15.0, 35.0, 35.0)
@@ -25,7 +25,7 @@ pub extern "C" fn vg_dfn_create(atten_lim_db: f32) -> *mut VgDfn {
             .with_mask_reduce(ReduceMask::MAX);
         let m = DfTract::new(DfParams::default(), &rp).ok()?;
         Some(Box::into_raw(Box::new(VgDfn { m })))
-    });
+    }));
     match r {
         Ok(Some(p)) => p,
         _ => std::ptr::null_mut(),
@@ -89,6 +89,6 @@ pub extern "C" fn vg_dfn_set_atten_lim(st: *mut VgDfn, db: f32) {
 #[no_mangle]
 pub extern "C" fn vg_dfn_destroy(st: *mut VgDfn) {
     if !st.is_null() {
-        let _ = catch_unwind(|| unsafe { drop(Box::from_raw(st)) });
+        let _ = catch_unwind(AssertUnwindSafe(|| unsafe { drop(Box::from_raw(st)) }));
     }
 }

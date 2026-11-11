@@ -1,6 +1,7 @@
 #include "SeparationEngine.h"
 #include <cmath>
 #include <limits>
+#include <algorithm>
 
 namespace
 {
@@ -19,6 +20,7 @@ namespace
     constexpr float xiFloor             = 1.0e-3f;
     constexpr float overSubtraction     = 2.5f;
     constexpr float gainSmoothing       = 0.70f;
+    constexpr float reverbOver          = 1.5f;   // neural mode: late-reverb estimate weighting
     constexpr float levelSmoothing      = 0.80f;
 }
 
@@ -84,6 +86,13 @@ void SeparationEngine::prepare (double sampleRate, int numChannels)
     reverbFactor = std::exp (-2.0f * delta * (float) reverbDelayFrames * (float) hop / (float) sr);
     alloc (history, reverbDelayFrames + 1, numBins);
 
+    envLen = juce::jmax (8, (int) std::round (0.12f * framesPerSec));   // 120 ms regression window
+    preLen = juce::jmax (4, (int) std::round (0.10f * framesPerSec));   // look-back for the offset
+    gapLen = juce::jmax (2, (int) std::round (0.03f * framesPerSec));   // skip the direct-sound drop
+    envDb.assign ((size_t) (envLen + preLen), -120.0f);
+    bandLo = juce::jmax (1, (int) std::round (300.0 * fftSize / sr));
+    bandHi = juce::jmin (fftSize / 2, (int) std::round (4000.0 * fftSize / sr));
+
     maskV.assign (nb, 1.0f);
     maskA.assign (nb, 0.0f);
     maskR.assign (nb, 0.0f);
@@ -92,6 +101,8 @@ void SeparationEngine::prepare (double sampleRate, int numChannels)
     tmpR.assign (nb, 0.0f);
     prevVoicePower.assign (nb, 0.0f);
     neuralAmp.assign (nb, 1.0f);
+    neuralRe.assign (nb, 1.0f);
+    neuralIm.assign (nb, 0.0f);
     cleanSmooth.assign (nb, 0.0f);
     revFrac.assign (nb, 0.0f);
 
@@ -157,12 +168,22 @@ void SeparationEngine::reset()
     std::fill (maskR.begin(), maskR.end(), 0.0f);
     std::fill (prevVoicePower.begin(), prevVoicePower.end(), 0.0f);
     std::fill (neuralAmp.begin(), neuralAmp.end(), 1.0f);
+    std::fill (neuralRe.begin(), neuralRe.end(), 1.0f);
+    std::fill (neuralIm.begin(), neuralIm.end(), 0.0f);
     std::fill (cleanSmooth.begin(), cleanSmooth.end(), 0.0f);
     std::fill (revFrac.begin(), revFrac.end(), 0.0f);
     std::fill (zBuf.begin(), zBuf.end(), 0.0f);
     if (useNeural)
         neural.reset();
     delayPos = 0;
+    rt60 = 0.3f;
+    roomRt60.store (useNeural ? rt60 : 0.0f);
+    std::fill (envDb.begin(), envDb.end(), -120.0f);
+    envPos = holdOff = candPos = 0;
+    frameCount = 0;
+    recentPeakDb = -120.0f;
+    decayCand.fill (0.0f);
+    decayWhen.fill (-1000000);
 
     hopCount = 0;
     subIndex = subCount = histPos = 0;
@@ -280,10 +301,14 @@ void SeparationEngine::processFrame() noexcept
     if (useNeural)
     {
         neuralMasks();
+        updateRoomEstimate();
+        const float delta = 3.0f * std::log (10.0f) / rt60;
+        const float factor = std::exp (-2.0f * delta * (float) reverbDelayFrames * (float) hop / (float) sr);
         for (size_t k = 0; k < NB; ++k)
         {
-            // late reverb of the *clean* voice (no noise can leak into the model)
-            const float rev  = reverbFactor * histRead[k];
+            // late reverb of the *clean* voice (no noise can leak into the model),
+            // with the decay of the room measured from the recording itself
+            const float rev  = reverbOver * factor * histRead[k];
             const float frac = rev / juce::jmax (cleanSmooth[k], rev + tiny);
             const float c = frac > revFrac[k] ? 0.5f : 0.75f;
             revFrac[k] = c * revFrac[k] + (1.0f - c) * frac;
@@ -394,11 +419,31 @@ void SeparationEngine::processFrame() noexcept
         eA += tmpA[k] * tmpA[k] * p;
         eR += tmpR[k] * tmpR[k] * p;
 
-        const float g = juce::jmin (8.0f, gV * tmpV[k] + gA * tmpA[k] + gR * tmpR[k]);
-        for (int ch = 0; ch < numCh; ++ch)
+        if (useNeural)
         {
-            fftData[(size_t) ch][2 * k]     *= g;
-            fftData[(size_t) ch][2 * k + 1] *= g;
+            // G = gA (1 - M) + M (gV (1 - rf) + gR rf), with M the (complex) voice mask
+            const float v = neuralAmp[k];
+            const float rf = v > 1.0e-6f ? tmpR[k] / v : 0.0f;
+            const float sv = gV * (1.0f - rf) + gR * rf;
+            const float gre = gA * (1.0f - neuralRe[k]) + neuralRe[k] * sv;
+            const float gim = (sv - gA) * neuralIm[k];
+            for (int ch = 0; ch < numCh; ++ch)
+            {
+                float& xr = fftData[(size_t) ch][2 * k];
+                float& xi = fftData[(size_t) ch][2 * k + 1];
+                const float r0 = xr;
+                xr = gre * r0 - gim * xi;
+                xi = gre * xi + gim * r0;
+            }
+        }
+        else
+        {
+            const float g = juce::jmin (8.0f, gV * tmpV[k] + gA * tmpA[k] + gR * tmpR[k]);
+            for (int ch = 0; ch < numCh; ++ch)
+            {
+                fftData[(size_t) ch][2 * k]     *= g;
+                fftData[(size_t) ch][2 * k + 1] *= g;
+            }
         }
     }
 
@@ -486,14 +531,115 @@ void SeparationEngine::neuralMasks() noexcept
         // amplitude ratio = how much of this bin the network kept as voice
         // (corrected for the resampling chain; above its band, the last valid decision)
         if (k > (size_t) neuralTopBin)
+        {
             neuralAmp[k] = neuralAmp[(size_t) neuralTopBin];
+            neuralRe[k] = neuralAmp[k];
+            neuralIm[k] = 0.0f;
+        }
         else if (pMid > 1.0e-14f)
         {
             const float g = chainGain[k];
-            neuralAmp[k] = juce::jlimit (0.0f, 1.0f, std::sqrt (pZ / (pMid * g * g)));
+            if (complexMask)
+            {
+                // complex ratio Z / X: keeps the phase corrections of the network's deep filter
+                const float zr = zData[2 * k], zi = zData[2 * k + 1];
+                float mr = (zr * re + zi * im) / (pMid * g);
+                float mi = (zi * re - zr * im) / (pMid * g);
+                const float mag = std::sqrt (mr * mr + mi * mi);
+                if (mag > 1.0f) { mr /= mag; mi /= mag; }
+                neuralRe[k] = mr;
+                neuralIm[k] = mi;
+                neuralAmp[k] = juce::jmin (1.0f, mag);
+            }
+            else
+            {
+                neuralAmp[k] = juce::jlimit (0.0f, 1.0f, std::sqrt (pZ / (pMid * g * g)));
+                neuralRe[k] = neuralAmp[k];
+                neuralIm[k] = 0.0f;
+            }
         }
 
         const float clean = neuralAmp[k] * neuralAmp[k] * power[k];
         cleanSmooth[k] = 0.6f * cleanSmooth[k] + 0.4f * clean;
+    }
+}
+
+void SeparationEngine::updateRoomEstimate() noexcept
+{
+    // envelope of the input in the speech band, minus what the network calls ambience
+    // (the tails themselves come from the room, which the network partly trims)
+    float e = 0.0f;
+    for (int k = bandLo; k < bandHi; ++k)
+    {
+        const float a = neuralAmp[(size_t) k];
+        e += power[(size_t) k] * a;
+    }
+    const float db = 10.0f * std::log10 (e + 1.0e-20f);
+
+    const int ring = envLen + preLen;
+    envDb[(size_t) envPos] = db;
+    envPos = (envPos + 1) % ring;
+    ++frameCount;
+    recentPeakDb = juce::jmax (db, recentPeakDb - 0.02f);   // slowly falling peak (~4 dB/s)
+
+    const float frameSec = (float) hop / (float) sr;
+    auto at = [this, ring] (int i) { return envDb[(size_t) ((envPos + i) % ring)]; };  // i = 0 oldest
+
+    // with no measurable tail for a while, drift towards a dry room
+    const int64_t horizon = (int64_t) (6.0f / frameSec);
+    int64_t newest = -horizon;
+    for (auto w : decayWhen) newest = juce::jmax (newest, w);
+    if (frameCount - newest > horizon)
+    {
+        rt60 += (0.15f - rt60) * (frameSec / 3.0f);
+        roomRt60.store (rt60, std::memory_order_relaxed);
+    }
+
+    if (holdOff > 0) { --holdOff; return; }
+    if (frameCount < ring) return;
+
+    // window = the last envLen frames; it must sit in a tail: a clearly louder
+    // level some 30-100 ms before the window started (the voice had stopped)
+    float before = -200.0f;
+    for (int i = 0; i < preLen - gapLen; ++i)
+        before = juce::jmax (before, at (i));
+
+    const int n = envLen;
+    float sx = 0, sy = 0, sxx = 0, sxy = 0;
+    int rises = 0;
+    float prev = 0.0f, first = 0.0f, last = 0.0f;
+    for (int i = 0; i < n; ++i)
+    {
+        const float y = at (preLen + i);
+        if (i == 0) first = y;
+        if (i > 0 && y > prev + 0.5f) ++rises;
+        prev = last = y;
+        sx += (float) i; sy += y; sxx += (float) (i * i); sxy += (float) i * y;
+    }
+    const float slopePerFrame = ((float) n * sxy - sx * sy) / ((float) n * sxx - sx * sx);
+    const float slope = slopePerFrame / frameSec;              // dB per second
+
+    // a free decay: after an offset, falling steadily by at least 6 dB, well above the floor
+    if (slope < -10.0f && before >= first + 3.0f && first - last >= 6.0f && rises <= n / 6
+        && before > recentPeakDb - 15.0f)
+    {
+        decayCand[(size_t) candPos] = juce::jlimit (0.08f, 3.0f, -60.0f / slope);
+        decayWhen[(size_t) candPos] = frameCount;
+        candPos = (candPos + 1) % (int) decayCand.size();
+        holdOff = n / 2;
+
+        // the room can't decay faster than its RT60: use the fast end of recent tails
+        std::array<float, 48> recent {};
+        int count = 0;
+        for (size_t i = 0; i < decayCand.size(); ++i)
+            if (frameCount - decayWhen[i] < horizon)
+                recent[(size_t) count++] = decayCand[i];
+        if (count >= 3)
+        {
+            std::sort (recent.begin(), recent.begin() + count);
+            const float target = juce::jlimit (0.1f, 2.5f, recent[(size_t) (count / 4)]);
+            rt60 += 0.25f * (target - rt60);
+            roomRt60.store (rt60, std::memory_order_relaxed);
+        }
     }
 }
