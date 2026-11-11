@@ -29,6 +29,13 @@ license (dual-licensed MIT OR Apache-2.0).
 The Rust crates it depends on (tract, ndarray, rustfft, ...) are MIT and/or
 Apache-2.0 licensed; see dfn/Cargo.lock for the exact list.
 
+## tract-linalg (patched copy in dfn/vendor/tract-linalg)
+
+tract-linalg 0.21.4 (https://github.com/sonos/tract), MIT OR Apache-2.0, vendored
+with one change: Apple AMX kernels are disabled (`has_amx()` returns false) so the
+plugin only uses documented NEON instructions on Apple Silicon. Its license files
+are kept in that folder.
+
 ## JUCE
 
 Built with JUCE 8 (https://juce.com), used under the terms of the JUCE license (AGPLv3 or a commercial JUCE license).
