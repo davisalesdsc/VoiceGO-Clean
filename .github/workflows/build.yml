@@ -116,8 +116,7 @@ jobs:
           done
           SPEECH="assets/clean_freesound_33711.wav assets/noise_freesound_2530.wav assets/rir_sim_1001_w11.7_l2.6_h2.5_rt60_0.7919.wav"
           arch -arm64 "$T" selftest
-          # under the debugger: if anything crashes, the log shows exactly where
-          lldb --batch -o "process launch" -k "thread backtrace all 25" -k "register read" -k "disassemble --pc --count 8" -k "quit 1" -- "$T" speech $SPEECH
+          arch -arm64 "$T" speech $SPEECH
           if arch -x86_64 /usr/bin/true 2>/dev/null; then
             arch -x86_64 "$T" selftest
             arch -x86_64 "$T" speech $SPEECH
