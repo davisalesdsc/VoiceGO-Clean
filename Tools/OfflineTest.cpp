@@ -307,6 +307,7 @@ int speechTests (const juce::File&, const juce::File&, const juce::File&, const 
 
 int main (int argc, char** argv)
 {
+    std::setvbuf (stdout, nullptr, _IONBF, 0);   // keep the output even if something crashes
     juce::StringArray args;
     for (int i = 1; i < argc; ++i) args.add (argv[i]);
 
