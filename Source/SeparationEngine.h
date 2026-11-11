@@ -4,6 +4,7 @@
 #include <atomic>
 #include <vector>
 #include <array>
+#include "NeuralVoice.h"
 
 /**
     VoiceGO Clean separation engine.
@@ -20,17 +21,28 @@
     The three masks always add up to 1, so with every gain at 0 dB the output
     is a bit-exact (up to float rounding) delayed copy of the input.
 
-    Latency = FFT size (2048 samples at 44.1/48 kHz).
+    Two analysis modes:
+      - Neural (default): DeepFilterNet3 estimates the clean voice; its
+        magnitude ratio against the input becomes the voice mask, and the
+        late-reverb model then runs on that clean voice only.
+        Latency = FFT size (1024 at 44.1/48 kHz) + neural delay (~40 ms).
+      - DSP (fallback when the model is unavailable): minimum statistics +
+        decision-directed Wiener mask. Latency = FFT size (2048 at 48 kHz).
 */
 class SeparationEngine
 {
 public:
     SeparationEngine() = default;
 
+    /** Call before prepare(); true = use the neural voice model when available. */
+    void setNeuralEnabled (bool shouldUse) noexcept { neuralWanted = shouldUse; }
+    bool isNeuralActive() const noexcept { return useNeural; }
+    const NeuralVoice& getNeural() const noexcept { return neural; }
+
     void prepare (double sampleRate, int numChannels);
     void reset();
 
-    int getLatencySamples() const noexcept { return fftSize; }
+    int getLatencySamples() const noexcept { return fftSize + (useNeural ? neuralDelay : 0); }
 
     /** Linear gains (0 = removed, 1 = unchanged). Thread-safe. */
     void setGains (float voice, float ambience, float reverb) noexcept;
@@ -87,8 +99,19 @@ private:
     std::vector<float> tmpV, tmpA, tmpR;
     std::vector<float> prevVoicePower;         // last frame's voice estimate (decision-directed)
     std::vector<float> voicePrior;
-    std::vector<int> bandStart, bandEnd;       // bin range of each display band             // frequency weighting for speech
+    std::vector<int> bandStart, bandEnd;       // bin range of each display band
     bool firstFrame = true;
+
+    // --- neural path ---------------------------------------------------------------
+    void neuralMasks() noexcept;
+    NeuralVoice neural;
+    bool neuralWanted = true, useNeural = false;
+    int neuralDelay = 0, delayPos = 0;
+    std::vector<std::vector<float>> delayLine;  // input delayed to line up with the neural estimate
+    std::vector<float> zBuf, zData;             // aligned neural voice (time) and its spectrum
+    std::vector<float> neuralAmp, cleanSmooth, revFrac;
+    std::vector<float> chainGain;               // resampling chain response (compensated in the mask)
+    int neuralTopBin = 0;                       // last bin the network actually covers
 
     // --- gains -----------------------------------------------------------------
     std::atomic<float> targetVoice { 1.0f }, targetAmb { 1.0f }, targetRev { 1.0f };

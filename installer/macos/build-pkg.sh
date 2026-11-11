@@ -99,6 +99,7 @@ mkdir -p "$WORK/root-suporte"
 cp "$HERE/Desinstalar.command" "$WORK/root-suporte/Desinstalar VoiceGO Clean.command"
 chmod +x "$WORK/root-suporte/Desinstalar VoiceGO Clean.command"
 cp "$HERE/../../README.md" "$WORK/root-suporte/LEIA-ME.md"
+cp "$HERE/../../THIRD-PARTY-NOTICES.md" "$WORK/root-suporte/LICENCAS-DE-TERCEIROS.md"
 pkgbuild --root "$WORK/root-suporte" --identifier "$ID.suporte" --version "$VERSION" \
          --install-location "$SUPPORT" "$WORK/pkgs/suporte.pkg" >/dev/null
 echo "  componente: suporte.pkg (desinstalador -> $SUPPORT)"

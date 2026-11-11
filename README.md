@@ -31,14 +31,22 @@ vá em *Ajustes do Sistema › Privacidade e Segurança › Abrir Mesmo Assim*.
 
 ## Como funciona
 
-Processamento no domínio STFT (FFT de 2048 a 44,1/48 kHz, 75% de sobreposição):
+**Motor neural (padrão, selo NEURAL na interface):**
 
-- **Ambience**: ruído estacionário estimado por *minimum statistics* (janela de 1,5 s).
-- **Voice reverb**: reverberação tardia por modelo estatístico de decaimento da sala (RT60 0,6 s),
-  alimentado só pela energia já limpa de ruído.
-- **Voice**: máscara de Wiener com SNR *decision-directed* contra (ruído + reverb).
-- As três máscaras somam sempre 1: com tudo em 0 dB a saída é idêntica à entrada (resíduo de −138 dB nos testes).
-- Latência: 2048 amostras (~43 ms), informada à DAW (compensação automática).
+- A voz é identificada pela rede **DeepFilterNet3** (embutida no plugin, roda localmente, sem internet).
+  A rede trabalha a 48 kHz; em 44,1/88,2/96 kHz o plugin reamostra com atraso exato e compensa a resposta do filtro.
+- A estimativa da rede vira uma **máscara por frequência** aplicada ao sinal original — as fases e o "ar" da voz
+  vêm da gravação, não de uma ressíntese.
+- **Ambience** = tudo o que a rede não reconhece como voz (ruído, ar-condicionado, trânsito, música de fundo…).
+- **Voice reverb** = cauda da sala estimada só sobre a voz já limpa (modelo de decaimento, RT60 0,6 s),
+  então ruído não vaza para o knob Voice.
+- As três partes somam sempre o original: com tudo em 0 dB a saída é idêntica à entrada.
+- Latência: ~61 ms a 48 kHz (rede + análise), informada à DAW (compensação automática).
+
+**Motor DSP (reserva, selo DSP):** se a rede não puder ser carregada, o plugin usa *minimum statistics* +
+máscara de Wiener *decision-directed* (latência 2048 amostras).
+
+Créditos e licenças de terceiros: [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 ## Compilar
 
@@ -49,12 +57,18 @@ A cada push na `main` com tudo passando, a Release `v<versão>` (versão do `CMa
 Assinatura/notarização (opcional): configure os secrets `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`,
 `APPLE_ID`, `APPLE_TEAM_ID` e `APPLE_APP_PASSWORD`. Sem eles, os bundles saem com assinatura ad-hoc.
 
-Testes do motor (qualquer sistema):
+Compilar exige **Rust** (`cargo`) além do CMake: a rede vem de `dfn/` (wrapper do libDF).
+Opções: `-DVOICEGO_DFN=neural` (padrão), `stub` (substituto só para testes) ou `none` (só DSP).
+
+Testes (qualquer sistema):
 
 ```bash
 cmake -S . -B build -DVOICEGO_BUILD_TESTS=ON && cmake --build build --target VoiceGOCleanTest
-./build/VoiceGOCleanTest_artefacts/Release/VoiceGOCleanTest selftest
+./build/VoiceGOCleanTest_artefacts/Release/VoiceGOCleanTest selftest          # motor DSP
+./build/VoiceGOCleanTest_artefacts/Release/VoiceGOCleanTest speech limpa.wav ruido.wav sala.wav saida/   # voz real
 ```
+
+O CI também publica *Exemplos-de-audio* (entrada, só voz, só ambiente, só reverb) a cada build.
 
 ## Formatos
 

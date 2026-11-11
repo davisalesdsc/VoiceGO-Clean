@@ -27,7 +27,13 @@ void SeparationEngine::prepare (double sampleRate, int numChannels)
     sr    = sampleRate > 0.0 ? sampleRate : 48000.0;
     numCh = juce::jmax (1, numChannels);
 
+    useNeural = neuralWanted && neural.prepare (sr);
+    neuralDelay = useNeural ? neural.getTotalDelay() : 0;
+
+    // the neural path needs less frequency resolution (the network already did the hard part)
     fftOrder = sr <= 50000.0 ? 11 : (sr <= 100000.0 ? 12 : 13);
+    if (useNeural)
+        --fftOrder;
     fftSize  = 1 << fftOrder;
     hop      = fftSize / 4;
     numBins  = fftSize / 2 + 1;
@@ -58,6 +64,9 @@ void SeparationEngine::prepare (double sampleRate, int numChannels)
     alloc (outAccum, numCh, fftSize);
     alloc (outReady, numCh, hop);
     alloc (fftData,  numCh, fftSize * 2);
+    alloc (delayLine, numCh, juce::jmax (1, neuralDelay));
+    zBuf.assign ((size_t) fftSize, 0.0f);
+    zData.assign ((size_t) fftSize * 2, 0.0f);
 
     const auto nb = (size_t) numBins;
     power.assign (nb, 0.0f);
@@ -82,6 +91,20 @@ void SeparationEngine::prepare (double sampleRate, int numChannels)
     tmpA.assign (nb, 0.0f);
     tmpR.assign (nb, 0.0f);
     prevVoicePower.assign (nb, 0.0f);
+    neuralAmp.assign (nb, 1.0f);
+    cleanSmooth.assign (nb, 0.0f);
+    revFrac.assign (nb, 0.0f);
+
+    chainGain.assign (nb, 1.0f);
+    neuralTopBin = numBins - 1;
+    if (useNeural)
+    {
+        chainGain = NeuralVoice::chainMagnitude ((int) std::lround (sr), neural.getModelRate(), fftOrder);
+        // above where the chain drops by 6 dB the network has no say: reuse its last decision
+        neuralTopBin = 1;
+        while (neuralTopBin + 1 < numBins && chainGain[(size_t) neuralTopBin + 1] > 0.5f)
+            ++neuralTopBin;
+    }
 
     // Speech prior: full weight 100 Hz - 9 kHz, tapering outside.
     // Energy below ~60 Hz is mostly rumble/handling noise, so it leans to "ambience".
@@ -121,7 +144,7 @@ void SeparationEngine::prepare (double sampleRate, int numChannels)
 
 void SeparationEngine::reset()
 {
-    for (auto* group : { &inBuf, &outAccum, &outReady, &fftData, &subMins, &history })
+    for (auto* group : { &inBuf, &outAccum, &outReady, &fftData, &subMins, &history, &delayLine })
         for (auto& v : *group)
             std::fill (v.begin(), v.end(), 0.0f);
 
@@ -133,6 +156,13 @@ void SeparationEngine::reset()
     std::fill (maskA.begin(), maskA.end(), 0.0f);
     std::fill (maskR.begin(), maskR.end(), 0.0f);
     std::fill (prevVoicePower.begin(), prevVoicePower.end(), 0.0f);
+    std::fill (neuralAmp.begin(), neuralAmp.end(), 1.0f);
+    std::fill (cleanSmooth.begin(), cleanSmooth.end(), 0.0f);
+    std::fill (revFrac.begin(), revFrac.end(), 0.0f);
+    std::fill (zBuf.begin(), zBuf.end(), 0.0f);
+    if (useNeural)
+        neural.reset();
+    delayPos = 0;
 
     hopCount = 0;
     subIndex = subCount = histPos = 0;
@@ -157,18 +187,45 @@ void SeparationEngine::process (juce::AudioBuffer<float>& buffer) noexcept
     const int n     = buffer.getNumSamples();
     const int writeBase = fftSize - hop;
 
+    const float monoNorm = 1.0f / (float) numCh;
+
     for (int i = 0; i < n; ++i)
     {
-        for (int ch = 0; ch < chans; ++ch)
-        {
-            auto* d = buffer.getWritePointer (ch);
-            inBuf[(size_t) ch][(size_t) (writeBase + hopCount)] = d[i];
-            d[i] = outReady[(size_t) ch][(size_t) hopCount];
-        }
+        const auto w = (size_t) (writeBase + hopCount);
 
-        // If the host gives fewer channels than prepared, keep the others silent
-        for (int ch = chans; ch < numCh; ++ch)
-            inBuf[(size_t) ch][(size_t) (writeBase + hopCount)] = 0.0f;
+        if (useNeural)
+        {
+            // the network hears the mono mix; the input is delayed to line up with it
+            float mono = 0.0f;
+            for (int ch = 0; ch < chans; ++ch)
+                mono += buffer.getSample (ch, i);
+            zBuf[w] = neural.process (mono * monoNorm);
+
+            for (int ch = 0; ch < numCh; ++ch)
+            {
+                auto& dl = delayLine[(size_t) ch];
+                const float x = ch < chans ? buffer.getSample (ch, i) : 0.0f;
+                inBuf[(size_t) ch][w] = dl[(size_t) delayPos];
+                dl[(size_t) delayPos] = x;
+            }
+            delayPos = (delayPos + 1) % neuralDelay;
+
+            for (int ch = 0; ch < chans; ++ch)
+                buffer.getWritePointer (ch)[i] = outReady[(size_t) ch][(size_t) hopCount];
+        }
+        else
+        {
+            for (int ch = 0; ch < chans; ++ch)
+            {
+                auto* d = buffer.getWritePointer (ch);
+                inBuf[(size_t) ch][w] = d[i];
+                d[i] = outReady[(size_t) ch][(size_t) hopCount];
+            }
+
+            // If the host gives fewer channels than prepared, keep the others silent
+            for (int ch = chans; ch < numCh; ++ch)
+                inBuf[(size_t) ch][w] = 0.0f;
+        }
 
         if (++hopCount == hop)
         {
@@ -216,6 +273,35 @@ void SeparationEngine::processFrame() noexcept
         firstFrame = false;
     }
 
+    auto& histWrite = history[(size_t) histPos];
+    const auto& histRead = history[(size_t) ((histPos + 1) % (reverbDelayFrames + 1))]; // Lf frames ago
+    histPos = (histPos + 1) % (reverbDelayFrames + 1);
+
+    if (useNeural)
+    {
+        neuralMasks();
+        for (size_t k = 0; k < NB; ++k)
+        {
+            // late reverb of the *clean* voice (no noise can leak into the model)
+            const float rev  = reverbFactor * histRead[k];
+            const float frac = rev / juce::jmax (cleanSmooth[k], rev + tiny);
+            const float c = frac > revFrac[k] ? 0.5f : 0.75f;
+            revFrac[k] = c * revFrac[k] + (1.0f - c) * frac;
+            histWrite[k] = cleanSmooth[k];
+        }
+        for (size_t k = 0; k < NB; ++k)
+        {
+            const size_t a = k > 0 ? k - 1 : k;
+            const size_t b = k + 1 < NB ? k + 1 : k;
+            const float rf = juce::jlimit (0.0f, 1.0f, 0.25f * revFrac[a] + 0.5f * revFrac[k] + 0.25f * revFrac[b]);
+            const float v  = neuralAmp[k];
+            tmpV[k] = v * (1.0f - rf);
+            tmpR[k] = v * rf;
+            tmpA[k] = 1.0f - v;
+        }
+    }
+    else
+    {
     // ---- 3. Stationary noise (ambience) with minimum statistics --------------
     for (size_t k = 0; k < NB; ++k)
     {
@@ -239,9 +325,6 @@ void SeparationEngine::processFrame() noexcept
     }
 
     // ---- 4. Late reverb estimate + masks -------------------------------------
-    auto& histWrite = history[(size_t) histPos];
-    const auto& histRead = history[(size_t) ((histPos + 1) % (reverbDelayFrames + 1))]; // Lf frames ago
-    histPos = (histPos + 1) % (reverbDelayFrames + 1);
 
     for (size_t k = 0; k < NB; ++k)
     {
@@ -290,6 +373,14 @@ void SeparationEngine::processFrame() noexcept
         tmpR[k] = r / s;
     }
 
+    for (size_t k = 0; k < NB; ++k)
+    {
+        prevVoicePower[k] = tmpV[k] * tmpV[k] * power[k];
+        // non-noise energy of this frame (confidence-weighted) feeds the late-reverb model
+        histWrite[k] = (tmpV[k] + tmpR[k]) * (tmpV[k] + tmpR[k]) * smoothPower[k];
+    }
+    } // DSP path
+
     // ---- 5. Gains -----------------------------------------------------------
     gV = gainSmoothing * gV + (1.0f - gainSmoothing) * targetVoice.load (std::memory_order_relaxed);
     gA = gainSmoothing * gA + (1.0f - gainSmoothing) * targetAmb.load (std::memory_order_relaxed);
@@ -299,9 +390,6 @@ void SeparationEngine::processFrame() noexcept
     for (size_t k = 0; k < NB; ++k)
     {
         const float p = power[k];
-        prevVoicePower[k] = tmpV[k] * tmpV[k] * p;
-        // non-noise energy of this frame (confidence-weighted) feeds the late-reverb model
-        histWrite[k] = (tmpV[k] + tmpR[k]) * (tmpV[k] + tmpR[k]) * smoothPower[k];
         eV += tmpV[k] * tmpV[k] * p;
         eA += tmpA[k] * tmpA[k] * p;
         eR += tmpR[k] * tmpR[k] * p;
@@ -365,5 +453,47 @@ void SeparationEngine::processFrame() noexcept
 
         auto& in = inBuf[(size_t) ch];
         std::copy (in.begin() + (long) H, in.end(), in.begin());
+    }
+
+    if (useNeural)
+        std::copy (zBuf.begin() + (long) H, zBuf.end(), zBuf.begin());
+}
+
+void SeparationEngine::neuralMasks() noexcept
+{
+    const auto N  = (size_t) fftSize;
+    const auto NB = (size_t) numBins;
+
+    for (size_t i = 0; i < N; ++i)
+        zData[i] = zBuf[i] * window[i];
+    std::fill (zData.begin() + (long) N, zData.end(), 0.0f);
+    fft->performRealOnlyForwardTransform (zData.data(), true);
+
+    const float chNorm = 1.0f / (float) numCh;
+    for (size_t k = 0; k < NB; ++k)
+    {
+        // spectrum of the mono mix = mean of the channel spectra (what the network heard)
+        float re = 0.0f, im = 0.0f;
+        for (int ch = 0; ch < numCh; ++ch)
+        {
+            re += fftData[(size_t) ch][2 * k];
+            im += fftData[(size_t) ch][2 * k + 1];
+        }
+        re *= chNorm; im *= chNorm;
+        const float pMid = re * re + im * im;
+        const float pZ   = zData[2 * k] * zData[2 * k] + zData[2 * k + 1] * zData[2 * k + 1];
+
+        // amplitude ratio = how much of this bin the network kept as voice
+        // (corrected for the resampling chain; above its band, the last valid decision)
+        if (k > (size_t) neuralTopBin)
+            neuralAmp[k] = neuralAmp[(size_t) neuralTopBin];
+        else if (pMid > 1.0e-14f)
+        {
+            const float g = chainGain[k];
+            neuralAmp[k] = juce::jlimit (0.0f, 1.0f, std::sqrt (pZ / (pMid * g * g)));
+        }
+
+        const float clean = neuralAmp[k] * neuralAmp[k] * power[k];
+        cleanSmooth[k] = 0.6f * cleanSmooth[k] + 0.4f * clean;
     }
 }

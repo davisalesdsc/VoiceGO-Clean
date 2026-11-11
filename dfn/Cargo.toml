@@ -1,0 +1,22 @@
+[package]
+name = "voicego_dfn"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Minimal C API around DeepFilterNet3 (libDF) for the VoiceGO Clean plugin"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+# DeepFilterNet (MIT OR Apache-2.0). The DeepFilterNet3 model is embedded via "default-model".
+deep_filter = { git = "https://github.com/Rikorose/DeepFilterNet", rev = "7b14b895fe7fc42cab72b4a4c1e49c982bd6404b", default-features = false, features = ["tract", "default-model"] }
+ndarray = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+panic = "unwind"

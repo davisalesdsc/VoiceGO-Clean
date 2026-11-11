@@ -1,6 +1,7 @@
 // Offline checks for the VoiceGO Clean engine.
 //
-//   VoiceGOCleanTest selftest                 -> synthetic tests, exit code 0 on success
+//   VoiceGOCleanTest selftest                 -> synthetic tests of the DSP engine, exit code 0 on success
+//   VoiceGOCleanTest plumbing / speech ...      -> neural path tests (Tools/NeuralTests.cpp)
 //   VoiceGOCleanTest process in.wav out.wav <voiceDb> <ambienceDb> <reverbDb>
 //                                           (use "off" for a removed component)
 
@@ -153,6 +154,7 @@ namespace
             const int n = scene.mix.getNumSamples();
 
             SeparationEngine e;
+            e.setNeuralEnabled (false);   // these tests cover the DSP engine
             e.prepare (sr, 2);
             const int L = e.getLatencySamples();
 
@@ -254,7 +256,7 @@ namespace
 
             // 5. Mono and odd block sizes must not crash / produce NaN
             {
-                SeparationEngine m; m.prepare (sr, 1);
+                SeparationEngine m; m.setNeuralEnabled (false); m.prepare (sr, 1);
                 juce::AudioBuffer<float> b (1, n); b.copyFrom (0, 0, scene.mix, 0, 0, n);
                 m.setGains (1.5f, 0.0f, 0.3f);
                 run (m, b, 17);
@@ -299,6 +301,9 @@ namespace
     }
 }
 
+int plumbingTests();
+int speechTests (const juce::File&, const juce::File&, const juce::File&, const juce::File&);
+
 int main (int argc, char** argv)
 {
     juce::StringArray args;
@@ -307,12 +312,22 @@ int main (int argc, char** argv)
     if (args.size() >= 1 && args[0] == "selftest")
         return selftest();
 
+    auto file = [] (const juce::String& p) { return juce::File::getCurrentWorkingDirectory().getChildFile (p); };
+
+    if (args.size() >= 1 && args[0] == "plumbing")
+        return plumbingTests();
+
+    if (args.size() >= 4 && args[0] == "speech")
+        return speechTests (file (args[1]), file (args[2]), file (args[3]), args.size() >= 5 ? file (args[4]) : juce::File());
+
     if (args.size() == 6 && args[0] == "process")
         return processFile (juce::File::getCurrentWorkingDirectory().getChildFile (args[1]),
                             juce::File::getCurrentWorkingDirectory().getChildFile (args[2]),
                             dbArg (args[3]), dbArg (args[4]), dbArg (args[5]));
 
     std::printf ("usage: VoiceGOCleanTest selftest\n"
+                 "       VoiceGOCleanTest plumbing                 (build with VOICEGO_DFN=stub)\n"
+                 "       VoiceGOCleanTest speech clean.wav noise.wav rir.wav [outDir]\n"
                  "       VoiceGOCleanTest process in.wav out.wav <voiceDb|off> <ambienceDb|off> <reverbDb|off>\n");
     return 2;
 }

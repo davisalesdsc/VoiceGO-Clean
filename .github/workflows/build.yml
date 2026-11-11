@@ -1,16 +1,18 @@
 name: Build e instalador (macOS Universal)
 
-# A cada push: compila, testa e gera o instalador .pkg (aba Actions > Artifacts).
-# Ao criar uma tag v* (ex.: v1.0.0): também publica uma Release com o .pkg.
+# A cada push (qualquer branch): compila, testa e gera o instalador .pkg (aba Actions > Artifacts).
+# Push na main com tudo passando: publica/atualiza a Release da versão do CMakeLists.txt.
 on:
   push:
-    branches: [ main ]
+    branches: [ "**" ]
     tags: [ "v*" ]
   pull_request:
   workflow_dispatch:
 
 env:
   BUILD_TYPE: Release
+  # áudios de teste do DeepFilterNet (só para os testes; não vão no plugin)
+  DFN_ASSETS: https://raw.githubusercontent.com/Rikorose/DeepFilterNet/7b14b895fe7fc42cab72b4a4c1e49c982bd6404b/assets
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -25,12 +27,41 @@ jobs:
           sudo apt-get update -q
           sudo apt-get install -y -q ninja-build libasound2-dev libfreetype-dev libfontconfig1-dev \
             libx11-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev
-      - name: Compilar
+      - name: Cache do Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/dfn-target
+          key: cargo-linux-${{ hashFiles('dfn/Cargo.lock', 'dfn/src/**') }}
+          restore-keys: cargo-linux-
+      - name: Compilar (com a rede neural)
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVOICEGO_BUILD_TESTS=ON
           cmake --build build --target VoiceGOCleanTest VoiceGOClean_VST3
-      - name: Testes do motor
+      - name: Testes do motor DSP
         run: ./build/VoiceGOCleanTest_artefacts/Release/VoiceGOCleanTest selftest
+      - name: Testes de alinhamento da rede (modelo substituto)
+        run: |
+          cmake -S . -B build-stub -G Ninja -DCMAKE_BUILD_TYPE=Release -DVOICEGO_BUILD_TESTS=ON -DVOICEGO_DFN=stub
+          cmake --build build-stub --target VoiceGOCleanTest
+          ./build-stub/VoiceGOCleanTest_artefacts/Release/VoiceGOCleanTest plumbing
+      - name: Testes com voz real (DeepFilterNet3)
+        run: |
+          mkdir -p assets exemplos
+          for f in clean_freesound_33711.wav noise_freesound_2530.wav rir_sim_1001_w11.7_l2.6_h2.5_rt60_0.7919.wav; do
+            curl -fsSL -o "assets/$f" "$DFN_ASSETS/$f"
+          done
+          ./build/VoiceGOCleanTest_artefacts/Release/VoiceGOCleanTest speech \
+            assets/clean_freesound_33711.wav assets/noise_freesound_2530.wav \
+            assets/rir_sim_1001_w11.7_l2.6_h2.5_rt60_0.7919.wav exemplos
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: Exemplos-de-audio
+          path: exemplos/*.wav
+          if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
   # macOS: um único instalador Universal (arm64 + x86_64): VST3, AU e app
@@ -42,8 +73,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Rust para as duas arquiteturas
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache do Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            build/dfn-target
+          key: cargo-macos-${{ hashFiles('dfn/Cargo.lock', 'dfn/src/**') }}
+          restore-keys: cargo-macos-
+
+      - name: Compilar a rede neural (Rust, Universal)
+        run: |
+          set -e
+          export MACOSX_DEPLOYMENT_TARGET=10.13
+          for t in aarch64-apple-darwin x86_64-apple-darwin; do
+            cargo build --release --locked --manifest-path dfn/Cargo.toml --target-dir build/dfn-target --target $t
+          done
+          mkdir -p build/dfn-universal
+          lipo -create build/dfn-target/aarch64-apple-darwin/release/libvoicego_dfn.a \
+                       build/dfn-target/x86_64-apple-darwin/release/libvoicego_dfn.a \
+               -output build/dfn-universal/libvoicego_dfn.a
+          lipo -info build/dfn-universal/libvoicego_dfn.a
+          ls -lh build/dfn-universal/libvoicego_dfn.a
+
       - name: Configurar (Universal)
-        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DVOICEGO_BUILD_TESTS=ON
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DVOICEGO_BUILD_TESTS=ON -DVOICEGO_DFN_PREBUILT="$PWD/build/dfn-universal/libvoicego_dfn.a"
 
       - name: Compilar
         run: cmake --build build --config $BUILD_TYPE --target VoiceGOClean_VST3 VoiceGOClean_AU VoiceGOClean_Standalone VoiceGOCleanTest -- -quiet
@@ -52,8 +110,19 @@ jobs:
         run: |
           T=./build/VoiceGOCleanTest_artefacts/$BUILD_TYPE/VoiceGOCleanTest
           lipo -info "$T"
+          mkdir -p assets
+          for f in clean_freesound_33711.wav noise_freesound_2530.wav rir_sim_1001_w11.7_l2.6_h2.5_rt60_0.7919.wav; do
+            curl -fsSL -o "assets/$f" "$DFN_ASSETS/$f"
+          done
+          SPEECH="assets/clean_freesound_33711.wav assets/noise_freesound_2530.wav assets/rir_sim_1001_w11.7_l2.6_h2.5_rt60_0.7919.wav"
           arch -arm64 "$T" selftest
-          if arch -x86_64 /usr/bin/true 2>/dev/null; then arch -x86_64 "$T" selftest; else echo "Rosetta indisponível: pulando teste x86_64"; fi
+          arch -arm64 "$T" speech $SPEECH
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then
+            arch -x86_64 "$T" selftest
+            arch -x86_64 "$T" speech $SPEECH
+          else
+            echo "Rosetta indisponível: pulando teste x86_64"
+          fi
 
       - name: Juntar os bundles e conferir Universal
         run: |

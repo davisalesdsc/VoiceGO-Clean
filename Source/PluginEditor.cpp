@@ -638,6 +638,18 @@ void MainContent::paint (juce::Graphics& g)
     g.drawText ("v" JucePlugin_VersionString, juce::Rectangle<float> (60.0f + wFirst + wSecond + 10.0f, 4.0f, 60.0f, 52.0f),
                 juce::Justification::centredLeft);
 
+    // engine badge: NEURAL (DeepFilterNet3) or DSP (fallback)
+    {
+        const bool neural = proc.engine.isNeuralActive();
+        auto badge = juce::Rectangle<float> (60.0f + wFirst + wSecond + 54.0f, 17.0f, neural ? 62.0f : 40.0f, 18.0f);
+        g.setColour (neural ? theme::accent.withAlpha (0.18f) : theme::panelAlt);
+        g.fillRoundedRectangle (badge, 9.0f);
+        g.setColour (neural ? theme::accentHv : theme::textMuted);
+        g.drawRoundedRectangle (badge.reduced (0.5f), 9.0f, 1.0f);
+        g.setFont (theme::font (10.0f, true));
+        g.drawText (neural ? "NEURAL" : "DSP", badge, juce::Justification::centred);
+    }
+
 }
 
 void PanelShape::paint (juce::Graphics& g)
