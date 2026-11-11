@@ -1,0 +1,162 @@
+name: Build e instalador (macOS Universal)
+
+# A cada push: compila, testa e gera o instalador .pkg (aba Actions > Artifacts).
+# Ao criar uma tag v* (ex.: v1.0.0): também publica uma Release com o .pkg.
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Testes do motor no Linux (rápido): transparência, ruído, reverb, voz
+  # ---------------------------------------------------------------------------
+  linux-tests:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependências
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ninja-build libasound2-dev libfreetype-dev libfontconfig1-dev \
+            libx11-dev libxcursor-dev libxext-dev libxinerama-dev libxrandr-dev libxrender-dev
+      - name: Compilar
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVOICEGO_BUILD_TESTS=ON
+          cmake --build build --target VoiceGOCleanTest VoiceGOClean_VST3
+      - name: Testes do motor
+        run: ./build/VoiceGOCleanTest_artefacts/Release/VoiceGOCleanTest selftest
+
+  # ---------------------------------------------------------------------------
+  # macOS: um único instalador Universal (arm64 + x86_64): VST3, AU e app
+  # ---------------------------------------------------------------------------
+  macos:
+    runs-on: macos-15
+    env:
+      HAS_SIGNING: ${{ secrets.MACOS_CERT_P12_BASE64 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar (Universal)
+        run: cmake -S . -B build -G Xcode -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DVOICEGO_BUILD_TESTS=ON
+
+      - name: Compilar
+        run: cmake --build build --config $BUILD_TYPE --target VoiceGOClean_VST3 VoiceGOClean_AU VoiceGOClean_Standalone VoiceGOCleanTest -- -quiet
+
+      - name: Testes do motor (nas duas arquiteturas)
+        run: |
+          T=./build/VoiceGOCleanTest_artefacts/$BUILD_TYPE/VoiceGOCleanTest
+          lipo -info "$T"
+          arch -arm64 "$T" selftest
+          if arch -x86_64 /usr/bin/true 2>/dev/null; then arch -x86_64 "$T" selftest; else echo "Rosetta indisponível: pulando teste x86_64"; fi
+
+      - name: Juntar os bundles e conferir Universal
+        run: |
+          set -e
+          mkdir -p out
+          A="build/VoiceGOClean_artefacts/$BUILD_TYPE"
+          for f in "VST3/VoiceGO Clean.vst3" "AU/VoiceGO Clean.component" "Standalone/VoiceGO Clean.app"; do
+            ditto "$A/$f" "out/$(basename "$f")"
+            BIN="out/$(basename "$f")/Contents/MacOS/VoiceGO Clean"
+            lipo -info "$BIN"
+            lipo "$BIN" -verify_arch arm64 x86_64
+          done
+
+      - name: Importar certificados (só se configurados)
+        if: env.HAS_SIGNING == 'true'
+        env:
+          P12: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          KC="$RUNNER_TEMP/sign.keychain-db"; KCPASS="$(uuidgen)"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KCPASS" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KCPASS" "$KC"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KC"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KCPASS" "$KC" >/dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          echo "APP_IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -o '"Developer ID Application[^"]*"' | head -1 | tr -d '"')" >> $GITHUB_ENV
+          echo "MAC_INSTALLER_IDENTITY=$(security find-identity -v "$KC" | grep -o '"Developer ID Installer[^"]*"' | head -1 | tr -d '"')" >> $GITHUB_ENV
+
+      - name: Assinar os bundles
+        run: |
+          set -e
+          if [ -n "${APP_IDENTITY:-}" ]; then
+            echo "Assinando com $APP_IDENTITY (hardened runtime)"
+            codesign --force --deep --options runtime --timestamp --sign "$APP_IDENTITY" "out/VoiceGO Clean.vst3"
+            codesign --force --deep --options runtime --timestamp --sign "$APP_IDENTITY" "out/VoiceGO Clean.component"
+            codesign --force --deep --options runtime --timestamp \
+                     --entitlements installer/macos/app.entitlements --sign "$APP_IDENTITY" "out/VoiceGO Clean.app"
+          else
+            echo "Sem certificado: assinatura ad-hoc (o Mac vai pedir confirmação ao abrir o instalador)"
+            for b in out/*; do codesign --force --deep --sign - "$b"; done
+          fi
+          for b in out/*; do codesign --verify --deep --strict "$b"; done
+
+      - name: Montar o .pkg
+        run: |
+          VERSION="$(grep -m1 -oE 'project\(VoiceGOClean VERSION [0-9.]+' CMakeLists.txt | awk '{print $3}')"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          PKG="VoiceGO-Clean-$VERSION-macOS-Universal.pkg"
+          echo "PKG=$PKG" >> $GITHUB_ENV
+          bash installer/macos/build-pkg.sh out "$VERSION" "$PKG"
+
+      - name: Notarizar (só se configurado)
+        if: env.HAS_SIGNING == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          xcrun notarytool submit "$PKG" --apple-id "$APPLE_ID" --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait
+          xcrun stapler staple "$PKG"
+
+      - name: Testar a instalação (e o AU com o auval da Apple)
+        run: |
+          set -e
+          sudo installer -pkg "$PKG" -target /
+          for p in "/Library/Audio/Plug-Ins/VST3/VoiceGO Clean.vst3" \
+                   "/Library/Audio/Plug-Ins/Components/VoiceGO Clean.component" \
+                   "/Applications/VoiceGO Clean.app" \
+                   "/Library/Application Support/VoiceGO Clean/Desinstalar VoiceGO Clean.command"; do
+            test -e "$p" && echo "ok: $p"
+          done
+          lipo -info "/Library/Audio/Plug-Ins/VST3/VoiceGO Clean.vst3/Contents/MacOS/VoiceGO Clean"
+          lipo -info "/Library/Audio/Plug-Ins/Components/VoiceGO Clean.component/Contents/MacOS/VoiceGO Clean"
+          killall -9 AudioComponentRegistrar 2>/dev/null || true
+          sleep 3
+          auval -v aufx Vgcl Vogo
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Instalador-macOS-Universal
+          path: VoiceGO-Clean-*-macOS-Universal.pkg
+
+  # ---------------------------------------------------------------------------
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [ linux-tests, macos ]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: Instalador-macOS-Universal, path: dist }
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          make_latest: true
+          body: |
+            **VoiceGO Clean para macOS — Universal** (Apple Silicon M1/M2/M3/M4 e Intel, macOS 10.13+)
+
+            Baixe o `.pkg` e dê dois cliques. Instala o plugin VST3, o AU e o app.
+            Depois, no REAPER: Options › Preferences › Plug-ins › VST › Re-scan.
+
+            Primeira vez (instalador ainda sem assinatura): se aparecer "desenvolvedor não identificado",
+            vá em Ajustes do Sistema › Privacidade e Segurança › **Abrir Mesmo Assim**.
